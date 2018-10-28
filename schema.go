@@ -95,6 +95,8 @@ type IndexSchema struct {
 
 	Unique  bool
 	Indexer Indexer
+
+	EnforceUnique bool
 }
 
 func (s *IndexSchema) Validate() error {

@@ -153,7 +153,8 @@ func (txn *Txn) Commit() {
 	}
 }
 
-// Insert is used to add or update an object into the given table
+// Insert is used to add or update an object into the given table.
+// If EnforceUnique is true, Update operations will return an error.
 func (txn *Txn) Insert(table string, obj interface{}) error {
 	if !txn.write {
 		return fmt.Errorf("cannot insert in read-only transaction")
@@ -180,12 +181,20 @@ func (txn *Txn) Insert(table string, obj interface{}) error {
 	idTxn := txn.writableIndex(table, id)
 	existing, update := idTxn.Get(idVal)
 
-	// On an update, there is an existing object with the given
-	// primary ID. We do the update by deleting the current object
-	// and inserting the new object.
-	for name, indexSchema := range tableSchema.Indexes {
-		indexTxn := txn.writableIndex(table, name)
+	if update && idSchema.Unique && idSchema.EnforceUnique {
+		return fmt.Errorf("unique constraint violeted for id schema")
+	}
 
+	keys := make([][][]byte, len(tableSchema.Indexes))
+	indices := make([]*iradix.Txn, len(tableSchema.Indexes))
+
+	// calculate all keys for indexes and make
+	// sure no constraint is being violeted
+	i := -1
+	for name, indexSchema := range tableSchema.Indexes {
+		i = i + 1
+		indexTxn := txn.writableIndex(table, name)
+		indices[i] = indexTxn
 		// Determine the new index value
 		var (
 			ok   bool
@@ -213,6 +222,34 @@ func (txn *Txn) Insert(table string, obj interface{}) error {
 			}
 		}
 
+		// Check if any Unique key is being violeted
+		if indexSchema.EnforceUnique && indexSchema.Unique {
+			for _, v := range vals {
+				if _, exists := indexTxn.Get(v); exists {
+					return fmt.Errorf("unique constraint violeted for '%s' index", indexSchema.Name)
+				}
+			}
+		}
+
+		// If there is no index value, either this is an error or an expected
+		// case and we can skip updating
+		if !ok {
+			if indexSchema.AllowMissing {
+				continue
+			} else {
+				return fmt.Errorf("missing value for index '%s'", name)
+			}
+		}
+
+		keys[i] = vals
+	}
+
+	i = -1
+	// On an update, there is an existing object with the given
+	// primary ID. We do the update by deleting the current object
+	// and inserting the new object.
+	for name, indexSchema := range tableSchema.Indexes {
+		i = i + 1
 		// Handle the update by deleting from the index first
 		if update {
 			var (
@@ -232,7 +269,7 @@ func (txn *Txn) Insert(table string, obj interface{}) error {
 				return fmt.Errorf("failed to build index '%s': %v", name, err)
 			}
 			if okExist {
-				for i, valExist := range valsExist {
+				for j, valExist := range valsExist {
 					// Handle non-unique index by computing a unique index.
 					// This is done by appending the primary key which must
 					// be unique anyways.
@@ -243,26 +280,16 @@ func (txn *Txn) Insert(table string, obj interface{}) error {
 					// If we are writing to the same index with the same value,
 					// we can avoid the delete as the insert will overwrite the
 					// value anyways.
-					if i >= len(vals) || !bytes.Equal(valExist, vals[i]) {
-						indexTxn.Delete(valExist)
+					if j >= len(keys[i]) || !bytes.Equal(valExist, keys[i][j]) {
+						indices[i].Delete(valExist)
 					}
 				}
 			}
 		}
 
-		// If there is no index value, either this is an error or an expected
-		// case and we can skip updating
-		if !ok {
-			if indexSchema.AllowMissing {
-				continue
-			} else {
-				return fmt.Errorf("missing value for index '%s'", name)
-			}
-		}
-
 		// Update the value of the index
-		for _, val := range vals {
-			indexTxn.Insert(val, obj)
+		for _, val := range keys[i] {
+			indices[i].Insert(val, obj)
 		}
 	}
 	return nil
